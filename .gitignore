@@ -1,0 +1,16 @@
+# === Ignore dataset ===
+data/
+__pycache__/
+*.pyc
+
+# === Ignore models ===
+chkpts/
+*.pt
+
+# === VS Code junk ===
+.vscode/
+
+# === Conda/venv ===
+*.env
+*.egg-info/
+*.log
