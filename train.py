@@ -32,19 +32,18 @@ TEST_IMG  = f"{DATASET_ROOT}/ISIC2018_Task3_Test_Input"
 LABELED_FRACTION = 0.20
 BATCH_L = 16
 RATIO_U = 3
-LR      = 1e-4
+LR      = 0.003  # SGD needs higher LR
 P_CUTOFF = 0.95
 LAMBDA_U = 1.0
 LS_ALPHA = 0.10
+BETA     = 0.999  # momentum for class-wise threshold update
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 def set_seed(seed=SEED):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
 
 def make_datasets():
     full_train = ISICDataset(csv_file=TRAIN_CSV, image_dir=TRAIN_IMG, mode="labeled")
@@ -62,7 +61,6 @@ def make_datasets():
 
     return labeled_ds, unlabeled_ds, val_ds, test_ds
 
-
 def make_loaders(labeled_ds, unlabeled_ds, val_ds, test_ds):
     labeled_loader   = DataLoader(labeled_ds,   batch_size=BATCH_L, shuffle=True,  drop_last=True, num_workers=4)
     unlabeled_loader = DataLoader(unlabeled_ds, batch_size=BATCH_L * RATIO_U, shuffle=True, drop_last=True, num_workers=4)
@@ -70,12 +68,10 @@ def make_loaders(labeled_ds, unlabeled_ds, val_ds, test_ds):
     test_loader      = DataLoader(test_ds,      batch_size=64, shuffle=False, num_workers=4)
     return labeled_loader, unlabeled_loader, val_loader, test_loader
 
-
 def build_model():
     model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
     model.classifier = nn.Linear(model.classifier.in_features, NUM_CLASSES)
     return model.to(DEVICE)
-
 
 @torch.no_grad()
 def evaluate(model, loader):
@@ -106,18 +102,17 @@ def evaluate(model, loader):
         auc = 0.0
     return acc, auc
 
-
 def train():
     set_seed()
     labeled_ds, unlabeled_ds, val_ds, test_ds = make_datasets()
     lb_loader, ulb_loader, val_loader, test_loader = make_loaders(labeled_ds, unlabeled_ds, val_ds, test_ds)
 
     model = build_model()
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=20, gamma=0.5)
+    opt = torch.optim.SGD(model.parameters(), lr=LR, momentum=0.9, weight_decay=5e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
 
-    classwise_count = [0 for _ in range(NUM_CLASSES)]
-    classwise_acc   = [0.0 for _ in range(NUM_CLASSES)]
+    threshold_per_class = torch.full((NUM_CLASSES,), P_CUTOFF).to(DEVICE)
+    pseudo_hist = torch.zeros(NUM_CLASSES).to(DEVICE)
 
     best_val_auc = -1.0
     steps_per_epoch = min(len(ulb_loader), len(lb_loader))
@@ -144,12 +139,12 @@ def train():
                 probs_w  = F.softmax(logits_w, dim=1)
                 max_probs, pseudo = probs_w.max(dim=1)
 
-            acc_tensor = torch.tensor(classwise_acc, device=DEVICE)
-            tau = P_CUTOFF * (acc_tensor[pseudo] / (2.0 - acc_tensor[pseudo]).clamp_min(1e-6))
-            mask = (max_probs >= tau).float()
+                mask = max_probs.ge(threshold_per_class[pseudo]).float()
 
             logits_s = model(x_s)
-            unsup_loss_all = F.cross_entropy(logits_s, pseudo, reduction='none', label_smoothing=LS_ALPHA)
+            pseudo_ls = F.one_hot(pseudo, NUM_CLASSES).float()
+            pseudo_ls = (1 - LS_ALPHA) * pseudo_ls + LS_ALPHA / NUM_CLASSES
+            unsup_loss_all = F.cross_entropy(logits_s, pseudo_ls, reduction='none')
             unsup_loss = (unsup_loss_all * mask).mean()
 
             loss = sup_loss + LAMBDA_U * unsup_loss
@@ -160,13 +155,12 @@ def train():
             sup_loss_meter  += sup_loss.item()
             unsup_loss_meter += unsup_loss.item()
 
-            confident = (max_probs >= P_CUTOFF)
-            if confident.any():
-                for c in pseudo[confident].tolist():
-                    classwise_count[c] += 1
-                mx = max(1, max(classwise_count))
-                for c in range(NUM_CLASSES):
-                    classwise_acc[c] = classwise_count[c] / mx
+            for c in range(NUM_CLASSES):
+                count = ((pseudo == c) & (max_probs >= threshold_per_class[c])).sum()
+                pseudo_hist[c] = BETA * pseudo_hist[c] + (1 - BETA) * count.float()
+
+            total_mask = pseudo_hist.max().clamp(min=1.0)
+            threshold_per_class = P_CUTOFF * (pseudo_hist / total_mask).clamp(min=0.05, max=1.0)
 
         scheduler.step()
 
@@ -177,17 +171,12 @@ def train():
 
         print(f"Epoch {epoch:02d} | Sup {avg_sup:.4f}  Unsup {avg_uns:.4f}  "
               f"ValAcc {val_acc:.2f}% AUC {val_auc:.4f} | "
-              f"TestAcc {test_acc:.2f}% AUC {test_auc:.4f} | "
-              f"C-acc {['%.2f' % a for a in classwise_acc]}")
+              f"TestAcc {test_acc:.2f}% AUC {test_auc:.4f}")
 
-        # Save best model by val AUC
         if val_auc > best_val_auc:
             best_val_auc = val_auc
             torch.save(model.state_dict(), "chkpts/best.pt")
-
-        # Also save every epoch
         torch.save(model.state_dict(), f"chkpts/epoch_{epoch:02d}.pt")
-
 
 if __name__ == "__main__":
     train()
