@@ -1,6 +1,0 @@
-run_id,description,val_acc,val_auc,test_acc,test_auc,note
-run_01,first baseline with pseudo-labeling only,81.35,0.9636,77.25,0.9305,classwise_acc used
-run_02,second tuning attempt,81.35,0.9521,76.26,0.9186,early stagnation after epoch 30
-run_03,faithful FaxMatch reproduction,84.46,0.9725,77.45,0.9288,close to paper results
-run_04,GMM thresholds adaptive (DYMatch-style),83.94,0.9643,78.84,0.9428,best test generalization
-run_05,GMM thresholds refined (init 0.95),83.94,0.9643,78.97,0.9355,stable test acc/auc
